@@ -1,106 +1,120 @@
-name: Capture Windows QUIC Profiles
+name: Capture Windows Browsers QUIC
 
 on:
   workflow_dispatch:
 
 jobs:
   capture-windows:
+    name: Windows QUIC Profile Capture
     runs-on: windows-latest
     steps:
-      - name: Install Wireshark / TShark & Browsers
+      - name: Install Wireshark and Firefox
         shell: powershell
         run: |
-          # 1. Установка Wireshark (с tshark)
+          # Установка tshark и Firefox через Chocolatey
           choco install wireshark -y --params "/AddToPath"
-          
-          # 2. Установка Firefox
           choco install firefox -y
 
-          # 3. Установка Яндекс Браузера через официальный Windows-установщик
-          $yandexInstaller = "$env:TEMP\YandexSetup.exe"
-          Invoke-WebRequest -Uri "https://browser.yandex.ru/download?banerid=6301000000&statpromo=true" -OutFile $yandexInstaller -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-          Start-Process -FilePath $yandexInstaller -ArgumentList "--silent", "--do-not-launch-browser" -Wait
-
-      - name: Run QUIC Capture for all browsers
+      - name: Download & Install Yandex Browser
         shell: powershell
         run: |
-          # Добавляем путь к tshark в текущую сессию
+          $installer = "$env:TEMP\YandexSetup.exe"
+          Write-Host "[*] Скачивание Яндекс Браузера..."
+          
+          # Скачиваем официальным curl.exe с переходом по 302 редиректам
+          curl.exe -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" `
+            -o $installer `
+            "https://browser.yandex.ru/download?os=win&bitness=64&banerid=6302000000"
+
+          Write-Host "[*] Тихая установка Яндекс Браузера..."
+          Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
+          Start-Sleep -Seconds 10
+
+      - name: Capture QUIC Initial Hex Streams
+        shell: powershell
+        run: |
           $env:Path += ";C:\Program Files\Wireshark"
 
-          # Словарь браузеров и путей к их .exe на Windows
-          $browsers = @{
+          # Ищем путь к Яндекс Браузеру (он может встать в LocalAppData или в Program Files)
+          $yandexPaths = @(
+              "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe",
+              "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe",
+              "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe"
+          )
+          $yandexExe = $yandexPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          $browsers = [ordered]@{
               "chrome"  = "C:\Program Files\Google\Chrome\Application\chrome.exe"
               "edge"    = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
               "firefox" = "C:\Program Files\Mozilla Firefox\firefox.exe"
-              "yandex"  = "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe"
+              "yandex"  = $yandexExe
           }
 
-          # Папка для результатов
           New-Item -ItemType Directory -Force -Path "./dumps"
 
           foreach ($name in $browsers.Keys) {
-              $exePath = $browsers[$name]
-              Write-Host "`n========================================"
-              Write-Host "[*] Снятие дампа для: $name"
-              Write-Host "Путь к файлу: $exePath"
-              Write-Host "========================================"
+              $exe = $browsers[$name]
+              Write-Host "`n==============================================="
+              Write-Host "[*] Сбор дампа для: $name"
+              Write-Host "Путь: $exe"
+              Write-Host "==============================================="
 
-              if (-not (Test-Path $exePath)) {
-                  Write-Warning "[-] Исполняемый файл $exePath не найден, пропускаем..."
+              if (-not $exe -or -not (Test-Path $exe)) {
+                  Write-Warning "[-] Исполняемый файл для $name не найден, пропускаем..."
                   continue
               }
 
               $pcapFile = "$env:TEMP\$name.pcap"
               if (Test-Path $pcapFile) { Remove-Item $pcapFile -Force }
 
-              # 1. Запуск tshark в фоне на физическом интерфейсе
+              # 1. Запуск tshark в фоне
               $tsharkJob = Start-Job -ScriptBlock {
                   param($pcap)
-                  & "C:\Program Files\Wireshark\tshark.exe" -i 1 -f "udp port 443" -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" -w $pcap
+                  & "C:\Program Files\Wireshark\tshark.exe" -i 1 -f "udp port 443" `
+                    -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" `
+                    -w $pcap
               } -ArgumentList $pcapFile
 
               Start-Sleep -Seconds 2
 
-              # 2. Запуск браузера с флагами принудительного QUIC
+              # 2. Запуск браузера с форсированием QUIC Initial
               $targetUrl = "https://ya.ru"
-              $tempProfile = "$env:TEMP\profile_$name"
-              
+              $profileDir = "$env:TEMP\profile_$name"
+
               if ($name -eq "firefox") {
-                  # Для Firefox создаем чистый профиль
-                  $process = Start-Process -FilePath $exePath -ArgumentList "-headless", "-url", $targetUrl -PassThru
+                  $process = Start-Process -FilePath $exe -ArgumentList "-headless", "-url", $targetUrl -PassThru
               } else {
-                  # Для Chromium-браузеров (Chrome, Edge, Yandex) форсируем QUIC v1 (h3)
                   $args = @(
                       "--headless=new",
                       "--disable-gpu",
                       "--enable-quic",
                       "--quic-version=h3",
-                      "--user-data-dir=$tempProfile",
+                      "--user-data-dir=$profileDir",
                       $targetUrl
                   )
-                  $process = Start-Process -FilePath $exePath -ArgumentList $args -PassThru
+                  $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
               }
 
-              # Даем браузеру 7 секунд на установление соединения
               Start-Sleep -Seconds 7
 
-              # 3. Закрываем браузер и останавливаем tshark
+              # 3. Закрытие браузера и остановка сниффера
               Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
               Stop-Job $tsharkJob -ErrorAction SilentlyContinue
               Receive-Job $tsharkJob -ErrorAction SilentlyContinue
               Remove-Job $tsharkJob -Force -ErrorAction SilentlyContinue
 
-              # 4. Извлекаем Hex Stream с помощью tshark
+              # 4. Извлечение первого Initial пакета в Hex Stream
               if (Test-Path $pcapFile) {
-                  $hexStreams = & "C:\Program Files\Wireshark\tshark.exe" -r $pcapFile -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" -T fields -e frame.raw
-                  
+                  $hexStreams = & "C:\Program Files\Wireshark\tshark.exe" -r $pcapFile `
+                    -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" `
+                    -T fields -e frame.raw
+
                   if ($hexStreams) {
-                      # Берем первую строку пакета Initial
                       $firstInitial = ($hexStreams -split "`r?`n")[0].Trim()
                       if ($firstInitial.Length -gt 0) {
                           $outFile = "./dumps/${name}_initial_hex.txt"
                           $firstInitial | Out-File -FilePath $outFile -Encoding ascii
-                          Write-Host "[+] УСПЕХ: $name Initial сохранен ($($firstInitial.Length) байт hex)" -ForegroundColor Green
+                          Write-Host "[+] УСПЕХ: $name Initial сохранен ($($firstInitial.Length) символов Hex)" -ForegroundColor Green
                           continue
                       }
                   }
@@ -108,7 +122,7 @@ jobs:
               Write-Warning "[-] Не удалось перехватить Initial пакет для $name"
           }
 
-      - name: Upload Windows QUIC Dumps
+      - name: Upload Windows Browser Dumps
         uses: actions/upload-artifact@v4
         with:
           name: windows-browser-dumps
