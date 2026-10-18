@@ -13,7 +13,6 @@ jobs:
       - name: Install Wireshark and Firefox
         shell: powershell
         run: |
-          # Wireshark ставим только ради утилиты tshark (для анализа pcapng)
           choco install wireshark -y
           choco install firefox -y
 
@@ -30,14 +29,13 @@ jobs:
           Write-Host "[*] Installing Yandex Browser..."
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
           
-          # Ожидание появления browser.exe (до 30 сек)
           $timer = 30
           while (-not (Test-Path "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe") -and $timer -gt 0) {
               Start-Sleep -Seconds 2
               $timer -= 2
           }
 
-      - name: Run QUIC Capture (via Windows Native PktMon)
+      - name: Run QUIC Capture
         shell: powershell
         run: |
           $pythonScript = @'
@@ -67,7 +65,8 @@ jobs:
           }
 
           os.makedirs('dumps', exist_ok=True)
-          target_url = 'https://ya.ru'
+          domain = 'ya.ru'
+          target_url = f'https://{domain}'
           temp_dir = tempfile.gettempdir()
 
           for name, exe in browsers.items():
@@ -87,40 +86,54 @@ jobs:
                       try: os.remove(f)
                       except: pass
 
-              # 1. Настройка встроенного Windows Packet Monitor
+              # 1. Сброс и настройка pktmon на захват порта 443
               subprocess.run(['pktmon', 'stop'], capture_output=True)
               subprocess.run(['pktmon', 'filter', 'remove'], capture_output=True)
-              subprocess.run(['pktmon', 'filter', 'add', '-t', 'UDP', '-p', '443'], capture_output=True)
+              subprocess.run(['pktmon', 'filter', 'add', '-p', '443'], capture_output=True)
 
-              # 2. Запуск захвата (пишет полные пакеты --pkt-size 0)
-              subprocess.run(['pktmon', 'start', '-c', '--pkt-size', '0', '-f', etl_path], capture_output=True)
+              # 2. Запуск захвата пакетов
+              subprocess.run(['pktmon', 'start', '--pkt-size', '0', '-f', etl_path], capture_output=True)
               time.sleep(2)
 
-              # 3. Запуск браузера с принудительным HTTP/3 (QUIC)
+              # 3. Подготовка профиля и запуск браузера с ПРИНУДИТЕЛЬНЫМ QUIC
               profile_dir = os.path.join(temp_dir, f'prof_{name}')
+              os.makedirs(profile_dir, exist_ok=True)
+
               if name == 'firefox':
-                  proc = subprocess.Popen([exe, '-headless', '-url', target_url])
+                  # Для Firefox создаем user.js с эмуляцией alt-svc для ya.ru
+                  user_js = os.path.join(profile_dir, 'user.js')
+                  with open(user_js, 'w') as f:
+                      f.write('user_pref("network.http.http3.enable", true);\n')
+                      f.write(f'user_pref("network.http.http3.alt-svc-mapping-for-testing", "{domain};h3=\\\":443\\\"");\n')
+                  
+                  proc = subprocess.Popen([exe, '-headless', '-profile', profile_dir, '-url', target_url])
               else:
+                  # Для Chromium-браузеров жестко форсируем QUIC на домен
                   proc = subprocess.Popen([
                       exe,
                       '--headless=new',
                       '--disable-gpu',
                       '--enable-quic',
                       '--quic-version=h3',
+                      f'--origin-to-force-quic-on={domain}:443',
                       f'--user-data-dir={profile_dir}',
                       target_url
                   ])
 
-              time.sleep(10)
+              # Ждем 8 секунд генерации рукопожатия
+              time.sleep(8)
 
-              # 4. Закрываем браузер и останавливаем запись
-              proc.kill()
+              # 4. Останавливаем браузер и сниффер
+              try: proc.kill()
+              except: pass
+              
               subprocess.run(['pktmon', 'stop'], capture_output=True)
 
-              # 5. Конвертируем нативный ETL дамп в стандартный PCAPNG
-              subprocess.run(['pktmon', 'etl2pcap', etl_path, '--out', pcapng_path], capture_output=True)
+              # 5. Конвертируем дамп в PCAPNG
+              conv = subprocess.run(['pktmon', 'etl2pcap', etl_path, '--out', pcapng_path], capture_output=True, text=True)
+              print(f'[+] Pktmon export: {conv.stdout.strip()}')
 
-              # 6. Извлекаем Hex Stream с помощью tshark (чтение файла НЕ требует Npcap!)
+              # 6. Извлекаем Initial пакеты через tshark
               if os.path.exists(pcapng_path):
                   cmd = [
                       tshark, '-r', pcapng_path,
@@ -129,13 +142,21 @@ jobs:
                   ]
                   res = subprocess.run(cmd, capture_output=True, text=True)
                   lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+                  
                   if lines:
                       first_initial = lines[0]
                       out_file = os.path.join('dumps', f'{name}_initial_hex.txt')
                       with open(out_file, 'w', encoding='ascii') as f:
                           f.write(first_initial)
-                      print(f'[+] SUCCESS: {name} Initial packet captured! Length: {len(first_initial)} hex chars')
+                      print(f'[+] SUCCESS: {name} Initial packet captured! (Hex length: {len(first_initial)})')
                       continue
+                  else:
+                      # Диагностика: проверим вообще были ли UDP пакеты
+                      chk = subprocess.run([tshark, '-r', pcapng_path, '-Y', 'udp', '-c', '5'], capture_output=True, text=True)
+                      if chk.stdout.strip():
+                          print(f'[-] UDP packets were seen, but QUIC Initial was not recognized.')
+                      else:
+                          print(f'[-] No UDP traffic on port 443 was captured.')
 
               print(f'[-] Failed to capture Initial packet for {name}')
 
