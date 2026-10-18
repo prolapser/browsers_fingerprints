@@ -7,10 +7,10 @@ jobs:
   capture:
     runs-on: ubuntu-latest
     steps:
-      - name: Install Tools, Edge and Yandex Browser
+      - name: Install Tools, Browsers & Xvfb
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark tcpdump curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark tcpdump curl xvfb
 
           # 1. Установка Microsoft Edge
           curl -fSsL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor | sudo tee /usr/share/keyrings/microsoft.gpg > /dev/null
@@ -22,7 +22,7 @@ jobs:
           curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o yandex.deb "https://browser.yandex.ru/download?os=linux&package=deb&x64=1"
           sudo apt-get install -y ./yandex.deb
 
-          # 3. Установка автономного Firefox через Playwright (чтобы избежать snap-контейнеров Ubuntu)
+          # 3. Установка автономного Firefox через Playwright
           pip install playwright
           python -m playwright install firefox
 
@@ -31,7 +31,6 @@ jobs:
           cat << 'EOF' > capture.py
           import os, sys, time, subprocess, tempfile, glob
 
-          # Ищем путь к установленному Playwright Firefox
           ff_pattern = os.path.expanduser("~/.cache/ms-playwright/firefox-*/firefox/firefox")
           ff_matches = glob.glob(ff_pattern)
           firefox_bin = ff_matches[0] if ff_matches else "/usr/bin/firefox"
@@ -51,7 +50,6 @@ jobs:
           for name, exe in browsers.items():
               print(f"\n===============================================")
               print(f"[*] Testing browser: {name}")
-              print(f"Binary path: {exe}")
 
               if not os.path.exists(exe):
                   print(f"[-] {name} binary not found, skipping.")
@@ -61,32 +59,30 @@ jobs:
               if os.path.exists(pcap_path):
                   os.remove(pcap_path)
 
-              # 1. Запуск tcpdump на интерфейсе "any"
+              # 1. Запуск tcpdump: перехватываем только исходящие пакеты к ya.ru:443
               dump_cmd = [
                   "sudo", "tcpdump", "-i", "any", "-U",
                   "-w", pcap_path,
-                  "udp and port 443"
+                  "udp and dst port 443"
               ]
               sniffer = subprocess.Popen(dump_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               time.sleep(1)
 
-              # 2. Запуск браузера с принудительным HTTP/3
+              # 2. Запуск браузера
               prof_dir = os.path.join(temp_dir, f"prof_{name}")
               os.makedirs(prof_dir, exist_ok=True)
 
               if name == "firefox":
-                  # Создаем user.js для Firefox с маппингом Alt-Svc
                   user_js = os.path.join(prof_dir, "user.js")
                   with open(user_js, "w") as f:
                       f.write('user_pref("network.http.http3.enable", true);\n')
                       f.write(f'user_pref("network.http.http3.alt-svc-mapping-for-testing", "{domain};h3=\\\":443\\\"");\n')
-                  
-                  proc = subprocess.Popen([exe, "-headless", "-profile", prof_dir, "-url", target_url])
+                  cmd = [exe, "-headless", "-profile", prof_dir, "-url", target_url]
               else:
-                  # Запуск Chromium c флагом --no-sandbox (ОБЯЗАТЕЛЬНО) и форсированием QUIC
-                  proc = subprocess.Popen([
+                  cmd = [
                       exe,
                       "--no-sandbox",
+                      "--disable-dev-shm-usage",
                       "--headless=new",
                       "--disable-gpu",
                       "--enable-quic",
@@ -94,41 +90,47 @@ jobs:
                       f"--origin-to-force-quic-on={domain}:443",
                       f"--user-data-dir={prof_dir}",
                       target_url
-                  ])
+                  ]
 
+              # Запуск под виртуальным X-сервером Xvfb
+              proc = subprocess.Popen(["xvfb-run", "-a"] + cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
               time.sleep(6)
 
-              # 3. Остановка процессов
               try: proc.kill()
               except: pass
               
               subprocess.run(["sudo", "killall", "-2", "tcpdump"], check=False)
               time.sleep(1)
 
-              # 4. Извлечение Initial пакета через tshark
+              # 3. Извлечение первого Initial пакета
               if os.path.exists(pcap_path):
-                  cmd = [
+                  # Форсируем tshark разбирать udp 443 как quic и берем фильтр quic
+                  tshark_cmd = [
                       "tshark", "-r", pcap_path,
-                      "-Y", "quic && quic.header_form == 1 && quic.long.packet_type == 0",
+                      "-d", "udp.port==443,quic",
+                      "-Y", "quic.header_form == 1 || (quic && udp.dstport == 443)",
                       "-T", "fields", "-e", "frame.raw"
                   ]
-                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  res = subprocess.run(tshark_cmd, capture_output=True, text=True)
                   lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+
+                  # Если фильтр по quic вернул пустоту, берем самый первый исходящий UDP-пакет (это и есть Initial)
+                  if not lines:
+                      fallback_cmd = [
+                          "tshark", "-r", pcap_path,
+                          "-Y", "udp.dstport == 443",
+                          "-T", "fields", "-e", "frame.raw"
+                      ]
+                      res = subprocess.run(fallback_cmd, capture_output=True, text=True)
+                      lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
 
                   if lines:
                       first_initial = lines[0]
                       out_file = os.path.join("dumps", f"{name}_initial_hex.txt")
                       with open(out_file, "w", encoding="ascii") as f:
                           f.write(first_initial)
-                      print(f"[+] SUCCESS: {name} Initial packet captured! (Hex len: {len(first_initial)})")
+                      print(f"[+] SUCCESS: {name} Initial captured! Hex length: {len(first_initial)}")
                       continue
-                  else:
-                      # Диагностика
-                      chk = subprocess.run(["tshark", "-r", pcap_path, "-Y", "udp", "-c", "2"], capture_output=True, text=True)
-                      if chk.stdout.strip():
-                          print("[-] UDP seen, but QUIC Initial filter did not match.")
-                      else:
-                          print("[-] No UDP traffic on port 443 recorded.")
 
               print(f"[-] Failed to capture Initial packet for {name}")
 
