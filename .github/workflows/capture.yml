@@ -11,7 +11,7 @@ jobs:
       - name: Install Wireshark and Firefox
         shell: powershell
         run: |
-          choco install wireshark -y --params "/AddToPath"
+          choco install wireshark -y
           choco install firefox -y
 
       - name: Download & Install Yandex Browser
@@ -27,24 +27,19 @@ jobs:
           Write-Host "[*] Установка Яндекс Браузера..."
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
           
-          # Даем установщику до 30 секунд завершить фоновое развертывание
-          $paths = @(
-              "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe",
-              "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe",
-              "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe"
-          )
+          # Ожидание появления исполняемого файла Яндекса (до 30 сек)
           $timer = 30
-          while (-not ($paths | Where-Object { Test-Path $_ }) -and $timer -gt 0) {
+          while (-not (Test-Path "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe") -and $timer -gt 0) {
               Start-Sleep -Seconds 2
               $timer -= 2
           }
 
-      - name: Run QUIC Capture (Python Runner)
-        shell: cmd
+      - name: Run QUIC Capture
+        shell: powershell
         run: |
-          python -c "
+          # Используем @' ... '@ чтобы PowerShell не пытался интерпретировать спецсимволы и кавычки
+          $pythonScript = @'
           import os, sys, time, subprocess, tempfile
-          from pathlib import Path
 
           tshark = r'C:\Program Files\Wireshark\tshark.exe'
           if not os.path.exists(tshark):
@@ -85,12 +80,12 @@ jobs:
           for name, exe in browsers.items():
               print(f'\n===============================================')
               print(f'[*] Запуск теста для: {name}')
-              print(f'Путь: {exe}')
 
               if not exe or not os.path.exists(exe):
                   print(f'[-] Браузер {name} не найден, пропускаем.')
                   continue
 
+              print(f'Путь: {exe}')
               pcap_path = os.path.join(tempfile.gettempdir(), f'{name}.pcap')
               if os.path.exists(pcap_path):
                   os.remove(pcap_path)
@@ -119,9 +114,10 @@ jobs:
                       target_url
                   ])
 
+              # Даем 8 секунд на установку QUIC соединения
               time.sleep(8)
 
-              # Остановка процессов
+              # Мягкая и жесткая остановка процессов
               proc.kill()
               sniff.terminate()
               try:
@@ -129,7 +125,7 @@ jobs:
               except:
                   sniff.kill()
 
-              # Извлечение Hex Stream
+              # Извлечение Hex Stream через tshark
               if os.path.exists(pcap_path):
                   cmd = [tshark, '-r', pcap_path, '-Y', 'quic && quic.header_form == 1 && quic.long.packet_type == 0', '-T', 'fields', '-e', 'frame.raw']
                   res = subprocess.run(cmd, capture_output=True, text=True)
@@ -139,11 +135,15 @@ jobs:
                       out_file = os.path.join('dumps', f'{name}_initial_hex.txt')
                       with open(out_file, 'w', encoding='ascii') as f:
                           f.write(first_initial)
-                      print(f'[+] УСПЕХ: {name} Initial сохранен ({len(first_initial)} hex-символов)')
+                      print(f'[+] УСПЕХ: {name} Initial пакет пойман! Длина: {len(first_initial)} hex-символов')
                       continue
 
               print(f'[-] Не удалось поймать Initial пакет для {name}')
-          "
+          '@
+
+          # Сохраняем Python скрипт на диск и запускаем его
+          Set-Content -Path script.py -Value $pythonScript
+          python script.py
 
       - name: Upload Windows Browser Dumps
         uses: actions/upload-artifact@v4
