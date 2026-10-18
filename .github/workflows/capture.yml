@@ -1,161 +1,115 @@
-name: Capture QUIC Initial Hex Streams
+name: Capture Windows QUIC Profiles
 
 on:
-  workflow_dispatch: # Позволяет запускать вручную кнопкой "Run workflow"
+  workflow_dispatch:
 
 jobs:
-  capture-ubuntu:
-    name: Capture Chrome, Firefox & Yandex (Ubuntu)
-    runs-on: ubuntu-latest
+  capture-windows:
+    runs-on: windows-latest
     steps:
-      - name: Install dependencies (tshark & browsers)
+      - name: Install Wireshark / TShark & Browsers
+        shell: powershell
         run: |
-          sudo apt-get update
-          # Установка tshark без интерактивных запросов
-          echo "wireshark-common wireshark-common/install-setuid boolean true" | sudo debconf-set-selections
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark wget
+          # 1. Установка Wireshark (с tshark)
+          choco install wireshark -y --params "/AddToPath"
           
-          # Установка Яндекс Браузера
-          wget -q https://repo.yandex.ru/yandex-browser/yandex-browser-stable_current_amd64.deb
-          sudo dpkg -i yandex-browser-stable_current_amd64.deb || sudo apt-get -f install -y
+          # 2. Установка Firefox
+          choco install firefox -y
 
-          # Установка Python-библиотеки управления браузерами
-          pip install playwright
-          python -m playwright install chromium firefox
+          # 3. Установка Яндекс Браузера через официальный Windows-установщик
+          $yandexInstaller = "$env:TEMP\YandexSetup.exe"
+          Invoke-WebRequest -Uri "https://browser.yandex.ru/download?banerid=6301000000&statpromo=true" -OutFile $yandexInstaller -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+          Start-Process -FilePath $yandexInstaller -ArgumentList "--silent", "--do-not-launch-browser" -Wait
 
-      - name: Run Capture Script
+      - name: Run QUIC Capture for all browsers
+        shell: powershell
         run: |
-          cat << 'EOF' > runner.py
-          import asyncio
-          import subprocess
-          import time
-          from playwright.async_api import async_playwright
+          # Добавляем путь к tshark в текущую сессию
+          $env:Path += ";C:\Program Files\Wireshark"
 
-          BROWSERS = [
-              ("chromium", "chrome_ubuntu"),
-              ("firefox", "firefox_ubuntu")
-          ]
+          # Словарь браузеров и путей к их .exe на Windows
+          $browsers = @{
+              "chrome"  = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+              "edge"    = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+              "firefox" = "C:\Program Files\Mozilla Firefox\firefox.exe"
+              "yandex"  = "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe"
+          }
 
-          async def capture(browser_type, name, custom_executable=None):
-              print(f"[*] Захват для: {name}")
-              pcap = f"{name}.pcap"
+          # Папка для результатов
+          New-Item -ItemType Directory -Force -Path "./dumps"
+
+          foreach ($name in $browsers.Keys) {
+              $exePath = $browsers[$name]
+              Write-Host "`n========================================"
+              Write-Host "[*] Снятие дампа для: $name"
+              Write-Host "Путь к файлу: $exePath"
+              Write-Host "========================================"
+
+              if (-not (Test-Path $exePath)) {
+                  Write-Warning "[-] Исполняемый файл $exePath не найден, пропускаем..."
+                  continue
+              }
+
+              $pcapFile = "$env:TEMP\$name.pcap"
+              if (Test-Path $pcapFile) { Remove-Item $pcapFile -Force }
+
+              # 1. Запуск tshark в фоне на физическом интерфейсе
+              $tsharkJob = Start-Job -ScriptBlock {
+                  param($pcap)
+                  & "C:\Program Files\Wireshark\tshark.exe" -i 1 -f "udp port 443" -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" -w $pcap
+              } -ArgumentList $pcapFile
+
+              Start-Sleep -Seconds 2
+
+              # 2. Запуск браузера с флагами принудительного QUIC
+              $targetUrl = "https://ya.ru"
+              $tempProfile = "$env:TEMP\profile_$name"
               
-              # Запуск tshark
-              proc = subprocess.Popen([
-                  "tshark", "-i", "any",
-                  "-f", "udp port 443",
-                  "-Y", "quic && quic.header_form == 1 && quic.long.packet_type == 0",
-                  "-w", pcap
-              ])
-              time.sleep(1)
+              if ($name -eq "firefox") {
+                  # Для Firefox создаем чистый профиль
+                  $process = Start-Process -FilePath $exePath -ArgumentList "-headless", "-url", $targetUrl -PassThru
+              } else {
+                  # Для Chromium-браузеров (Chrome, Edge, Yandex) форсируем QUIC v1 (h3)
+                  $args = @(
+                      "--headless=new",
+                      "--disable-gpu",
+                      "--enable-quic",
+                      "--quic-version=h3",
+                      "--user-data-dir=$tempProfile",
+                      $targetUrl
+                  )
+                  $process = Start-Process -FilePath $exePath -ArgumentList $args -PassThru
+              }
 
-              async with async_playwright() as p:
-                  launch_args = {"headless": True}
-                  if custom_executable:
-                      launch_args["executable_path"] = custom_executable
-                      launch_args["args"] = ["--no-sandbox", "--enable-quic", "--quic-version=h3"]
-                      b = await p.chromium.launch(**launch_args)
-                  elif browser_type == "chromium":
-                      launch_args["args"] = ["--enable-quic", "--quic-version=h3"]
-                      b = await p.chromium.launch(**launch_args)
-                  else:
-                      b = await p.firefox.launch(headless=True, firefox_user_prefs={"network.http.http3.enable": True})
+              # Даем браузеру 7 секунд на установление соединения
+              Start-Sleep -Seconds 7
 
-                  page = await b.new_page()
-                  try:
-                      await page.goto("https://ya.ru", timeout=7000)
-                      await page.reload(timeout=7000)
-                  except:
-                      pass
-                  await b.close()
+              # 3. Закрываем браузер и останавливаем tshark
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              Stop-Job $tsharkJob -ErrorAction SilentlyContinue
+              Receive-Job $tsharkJob -ErrorAction SilentlyContinue
+              Remove-Job $tsharkJob -Force -ErrorAction SilentlyContinue
 
-              time.sleep(2)
-              proc.terminate()
+              # 4. Извлекаем Hex Stream с помощью tshark
+              if (Test-Path $pcapFile) {
+                  $hexStreams = & "C:\Program Files\Wireshark\tshark.exe" -r $pcapFile -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" -T fields -e frame.raw
+                  
+                  if ($hexStreams) {
+                      # Берем первую строку пакета Initial
+                      $firstInitial = ($hexStreams -split "`r?`n")[0].Trim()
+                      if ($firstInitial.Length -gt 0) {
+                          $outFile = "./dumps/${name}_initial_hex.txt"
+                          $firstInitial | Out-File -FilePath $outFile -Encoding ascii
+                          Write-Host "[+] УСПЕХ: $name Initial сохранен ($($firstInitial.Length) байт hex)" -ForegroundColor Green
+                          continue
+                      }
+                  }
+              }
+              Write-Warning "[-] Не удалось перехватить Initial пакет для $name"
+          }
 
-              # Извлечение Hex Stream
-              cmd = ["tshark", "-r", pcap, "-Y", "quic && quic.header_form == 1 && quic.long.packet_type == 0", "-T", "fields", "-e", "frame.raw"]
-              out = subprocess.check_output(cmd, text=True).strip().split("\n")
-              if out and out[0]:
-                  with open(f"{name}_initial_hex.txt", "w") as f:
-                      f.write(out[0].strip())
-                  print(f"[+] Успех! Пакет сохранен для {name}")
-
-          async def main():
-              for b_type, b_name in BROWSERS:
-                  await capture(b_type, b_name)
-              # Захват Яндекс Браузера
-              await capture("chromium", "yandex_browser_ubuntu", custom_executable="/usr/bin/yandex-browser-stable")
-
-          asyncio.run(main())
-          EOF
-
-          python runner.py
-
-      - name: Upload Ubuntu Artifacts
+      - name: Upload Windows QUIC Dumps
         uses: actions/upload-artifact@v4
         with:
-          name: dumps-linux
-          path: "*_initial_hex.txt"
-
-  capture-macos:
-    name: Capture Safari / WebKit (macOS)
-    runs-on: macos-latest
-    steps:
-      - name: Setup Python & Playwright (WebKit)
-        run: |
-          pip install playwright
-          python -m playwright install webkit
-
-      - name: Capture WebKit / Safari
-        run: |
-          # Запуск tcpdump в фоне
-          sudo tcpdump -i en0 -s 0 -w safari.pcap udp port 443 &
-          TCPDUMP_PID=$!
-          sleep 2
-
-          python -c '
-          import asyncio
-          from playwright.async_api import async_playwright
-
-          async def run():
-              async with async_playwright() as p:
-                  browser = await p.webkit.launch(headless=True)
-                  page = await browser.new_page()
-                  try:
-                      await page.goto("https://ya.ru", timeout=8000)
-                      await page.reload(timeout=8000)
-                  except:
-                      pass
-                  await browser.close()
-          asyncio.run(run())
-          '
-
-          sleep 2
-          sudo kill -2 $TCPDUMP_PID || true
-
-          # Преобразуем pcap в Hex Stream при помощи Python
-          python -c '
-          import os
-          try:
-              from scapy.all import rdpcap, Raw
-          except:
-              os.system("pip install scapy")
-              from scapy.all import rdpcap, Raw
-
-          pkts = rdpcap("safari.pcap")
-          for p in pkts:
-              # Поиск QUIC Long Header Initial (байт 0xc0-0xcf и версия QUIC v1)
-              if p.haslayer(Raw):
-                  payload = bytes(p[Raw].load)
-                  if len(payload) > 5 and (payload[0] & 0xf0 == 0xc0) and payload[1:5] == b"\x00\x00\x00\x01":
-                      with open("safari_macos_initial_hex.txt", "w") as f:
-                          f.write(bytes(p).hex())
-                      print("[+] Safari Initial найден и сохранен")
-                      break
-          '
-
-      - name: Upload macOS Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dumps-macos
-          path: "*_initial_hex.txt"
+          name: windows-browser-dumps
+          path: dumps/*.txt
