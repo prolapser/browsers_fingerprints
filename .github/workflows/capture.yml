@@ -2,58 +2,88 @@ name: Multi-OS QUIC Initial Dumps
 
 on:
   workflow_dispatch:
+    inputs:
+      target_browser:
+        description: 'Какой браузер запустить? (выберите yandex_win)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - yandex_win
+          - chrome_win
+          - edge_win
+          - firefox_win
+          - chrome_linux
+          - edge_linux
+          - yandex_linux
+          - firefox_linux
+          - chrome_mac
+          - edge_mac
+          - firefox_mac
+          - webkit_mac
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
+  # ============================================================================
+  # 0. ДИНАМИЧЕСКИЙ ВЫБОР: запускаем 1 раннер или все 12
+  # ============================================================================
+  prepare:
+    name: Select Target Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          TARGET="${{ github.event.inputs.target_browser }}"
+          ALL_BROWSERS='[
+            {"os": "ubuntu-latest", "browser_id": "chrome_linux"},
+            {"os": "ubuntu-latest", "browser_id": "edge_linux"},
+            {"os": "ubuntu-latest", "browser_id": "yandex_linux"},
+            {"os": "ubuntu-latest", "browser_id": "firefox_linux"},
+            {"os": "windows-latest", "browser_id": "chrome_win"},
+            {"os": "windows-latest", "browser_id": "edge_win"},
+            {"os": "windows-latest", "browser_id": "yandex_win"},
+            {"os": "windows-latest", "browser_id": "firefox_win"},
+            {"os": "macos-latest", "browser_id": "chrome_mac"},
+            {"os": "macos-latest", "browser_id": "edge_mac"},
+            {"os": "macos-latest", "browser_id": "firefox_mac"},
+            {"os": "macos-latest", "browser_id": "webkit_mac"}
+          ]'
+          if [ -z "$TARGET" ] || [ "$TARGET" = "all" ]; then
+            echo "matrix={\"include\": $ALL_BROWSERS}" >> $GITHUB_OUTPUT
+          else
+            SELECTED=$(echo "$ALL_BROWSERS" | jq -c "[.[] | select(.browser_id == \"$TARGET\")]")
+            echo "matrix={\"include\": $SELECTED}" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================================================
+  # 1. ЗАХВАТ ДАМПОВ
+  # ============================================================================
   capture:
     name: ${{ matrix.browser_id }} (${{ matrix.os }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Linux
-          - os: ubuntu-latest
-            browser_id: chrome_linux
-          - os: ubuntu-latest
-            browser_id: edge_linux
-          - os: ubuntu-latest
-            browser_id: yandex_linux
-          - os: ubuntu-latest
-            browser_id: firefox_linux
-
-          # Windows
-          - os: windows-latest
-            browser_id: chrome_win
-          - os: windows-latest
-            browser_id: edge_win
-          - os: windows-latest
-            browser_id: yandex_win
-          - os: windows-latest
-            browser_id: firefox_win
-
-          # macOS
-          - os: macos-latest
-            browser_id: chrome_mac
-          - os: macos-latest
-            browser_id: edge_mac
-          - os: macos-latest
-            browser_id: firefox_mac
-          - os: macos-latest
-            browser_id: webkit_mac
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ==========================================
-      # 1. LINUX SETUP
+      # LINUX SETUP
       # ==========================================
       - name: Setup Tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump curl libcap2-bin
-          # Разрешаем запуск tcpdump без sudo
           sudo setcap cap_net_raw,cap_net_admin=eip $(which tcpdump)
           pip install playwright scapy
 
@@ -76,7 +106,7 @@ jobs:
           python -m playwright install --with-deps firefox
 
       # ==========================================
-      # 2. WINDOWS SETUP
+      # WINDOWS SETUP
       # ==========================================
       - name: Setup Tools (Windows)
         if: runner.os == 'Windows'
@@ -99,12 +129,11 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
 
       # ==========================================
-      # 3. MACOS SETUP
+      # MACOS SETUP
       # ==========================================
       - name: Setup Tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          # Разрешаем непривилегированный захват BPF без sudo во избежание зомби-процессов
           sudo chmod 666 /dev/bpf*
           pip install playwright scapy
 
@@ -119,7 +148,7 @@ jobs:
           python -m playwright install firefox chromium webkit
 
       # ==========================================
-      # 4. CAPTURE SCRIPT
+      # EXECUTE CAPTURE
       # ==========================================
       - name: Execute QUIC Capture Script
         env:
@@ -134,7 +163,6 @@ jobs:
           import time
           import subprocess
 
-          # Принудительный мгновенный вывод в консоль GitHub Actions
           print = functools.partial(print, flush=True)
 
           from playwright.async_api import async_playwright
@@ -194,11 +222,10 @@ jobs:
 
           cfg = browsers[target_browser]
 
-          # Определение дефолтного сетевого интерфейса macOS
           macos_iface = "en0"
           if os_name == "darwin":
               try:
-                  route_out = subprocess.check_output("route -n get default", shell=True, text=True)
+                  route_out = subprocess.check_output(["route", "-n", "get", "default"], text=True)
                   for line in route_out.splitlines():
                       if "interface:" in line:
                           macos_iface = line.split(":")[1].strip()
@@ -210,20 +237,21 @@ jobs:
           def start_sniffer(pcap_path):
               if os_name == "win32":
                   etl_path = pcap_path.replace(".pcap", ".etl")
-                  subprocess.run(["pktmon", "stop"], capture_output=True)
-                  subprocess.run(["pktmon", "filter", "remove"], capture_output=True)
-                  subprocess.run(["pktmon", "filter", "add", "-p", "443", "-t", "UDP"], capture_output=True)
-                  subprocess.run(["pktmon", "start", "-c", "--pkt-size", "0", "-f", etl_path], capture_output=True)
+                  try:
+                      subprocess.run(["pktmon", "stop"], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                      subprocess.run(["pktmon", "filter", "remove"], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                      subprocess.run(["pktmon", "filter", "add", "-p", "443", "-t", "UDP"], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                      subprocess.run(["pktmon", "start", "-c", "--pkt-size", "0", "-f", etl_path], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                  except Exception as e:
+                      print(f"[-] pktmon start error: {e}")
                   return None
               elif os_name == "darwin":
-                  # Без sudo, так как права выданы на /dev/bpf*
                   return subprocess.Popen(
                       ["tcpdump", "-i", macos_iface, "-n", "-l", "-U", "-w", pcap_path, "udp port 443"],
                       stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL
                   )
               else:
-                  # На Linux tcpdump запускается без sudo благодаря setcap
                   return subprocess.Popen(
                       ["tcpdump", "-i", "any", "-n", "-l", "-U", "-w", pcap_path, "udp port 443"],
                       stdout=subprocess.DEVNULL,
@@ -234,10 +262,19 @@ jobs:
               time.sleep(0.15)
               if os_name == "win32":
                   etl_path = pcap_path.replace(".pcap", ".etl")
-                  subprocess.run(["pktmon", "stop"], capture_output=True)
-                  subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True)
+                  try:
+                      subprocess.run(["pktmon", "stop"], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                  except Exception:
+                      pass
+                  try:
+                      subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                  except Exception:
+                      pass
                   if not os.path.exists(pcap_path):
-                      subprocess.run(["pktmon", "pcapng", etl_path, "-o", pcap_path], capture_output=True)
+                      try:
+                          subprocess.run(["pktmon", "pcapng", etl_path, "-o", pcap_path], capture_output=True, stdin=subprocess.DEVNULL, timeout=4)
+                      except Exception:
+                          pass
               else:
                   if proc:
                       try:
@@ -248,8 +285,7 @@ jobs:
                               proc.kill()
                           except Exception:
                               pass
-                  # Гарантированная зачистка без спама в stderr
-                  subprocess.run(["killall", "-9", "tcpdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                  subprocess.run(["killall", "-9", "tcpdump"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, check=False)
 
           def extract_clean_quic_hex(pcap_path):
               if not os.path.exists(pcap_path):
@@ -270,6 +306,43 @@ jobs:
               for i in range(0, len(lst), n):
                   yield lst[i:i + n]
 
+          async def probe_single_domain(context, domain, name, tier_dir, chunk_idx, d_idx, total_in_chunk):
+              idx_str = f"{d_idx}/{total_in_chunk}"
+              pcap_file = os.path.abspath(f"{name}_c{chunk_idx}_d{d_idx}.pcap")
+              etl_file = pcap_file.replace(".pcap", ".etl")
+
+              target_url = f"https://{domain}"
+              sniff_proc = start_sniffer(pcap_file)
+              time.sleep(0.1)
+
+              try:
+                  page = await context.new_page()
+                  try:
+                      await page.goto(target_url, timeout=1500)
+                  except Exception:
+                      pass
+                  try:
+                      await asyncio.wait_for(page.close(), timeout=1.5)
+                  except Exception:
+                      pass
+              finally:
+                  stop_sniffer(sniff_proc, pcap_file)
+
+              hex_data = extract_clean_quic_hex(pcap_file)
+              if hex_data:
+                  filename = f"{os_name}_{name}_{domain}_initial.hex"
+                  out_file = os.path.join(tier_dir, filename)
+                  with open(out_file, "w", encoding="ascii") as f:
+                      f.write(hex_data)
+                  print(f"[+] [{idx_str}] SUCCESS: {domain} ({len(hex_data)//2} B) -> {filename}")
+              else:
+                  print(f"[-] [{idx_str}] No QUIC Initial on {domain}")
+
+              for f in [pcap_file, etl_file]:
+                  if os.path.exists(f):
+                      try: os.remove(f)
+                      except Exception: pass
+
           async def capture_browser(p, name, cfg):
               b_type = cfg["type"]
               b_path = cfg["path"]
@@ -279,8 +352,6 @@ jobs:
                   return
 
               print(f"[*] Processing: {name} ({b_type})")
-              pcap_file = os.path.abspath(f"{name}.pcap")
-              etl_file = pcap_file.replace(".pcap", ".etl")
 
               for tier_key, domains in tiers.items():
                   tier_dir = os.path.join(dump_dir, tier_key)
@@ -291,7 +362,6 @@ jobs:
 
                   print(f"\n[*] Starting {tier_key} ({len(domains)} domains)")
 
-                  # Обработка пачками по 300 доменов
                   for chunk_idx, chunk in enumerate(chunk_list(domains, 300), 1):
                       print(f"[*] Launching {name} for batch {chunk_idx} ({len(chunk)} domains)...")
 
@@ -321,38 +391,16 @@ jobs:
                       context = await browser.new_context(ignore_https_errors=True)
 
                       for d_idx, domain in enumerate(chunk, 1):
-                          if os.path.exists(pcap_file):
-                              try: os.remove(pcap_file)
-                              except: pass
-                          if os.path.exists(etl_file):
-                              try: os.remove(etl_file)
-                              except: pass
-
-                          target_url = f"https://{domain}"
-                          sniff_proc = start_sniffer(pcap_file)
-                          time.sleep(0.1)
-
                           try:
-                              page = await context.new_page()
-                              try:
-                                  await page.goto(target_url, timeout=1500)
-                              except Exception:
-                                  pass
-                              await page.close()
+                              await asyncio.wait_for(
+                                  probe_single_domain(context, domain, name, tier_dir, chunk_idx, d_idx, len(chunk)),
+                                  timeout=7.0
+                              )
+                          except asyncio.TimeoutError:
+                              print(f"[-] [{d_idx}/{len(chunk)}] TIMEOUT (>7s) on {domain}, skipping...")
+                              stop_sniffer(None, os.path.abspath(f"{name}_c{chunk_idx}_d{d_idx}.pcap"))
                           except Exception as e:
-                              print(f"[-] Page error on {domain}: {e}")
-                          finally:
-                              stop_sniffer(sniff_proc, pcap_file)
-
-                          hex_data = extract_clean_quic_hex(pcap_file)
-                          if hex_data:
-                              filename = f"{os_name}_{name}_{domain}_initial.hex"
-                              out_file = os.path.join(tier_dir, filename)
-                              with open(out_file, "w", encoding="ascii") as f:
-                                  f.write(hex_data)
-                              print(f"[+] [{d_idx}/{len(chunk)}] SUCCESS: {domain} ({len(hex_data)//2} B) -> {filename}")
-                          else:
-                              print(f"[-] [{d_idx}/{len(chunk)}] No QUIC Initial on {domain}")
+                              print(f"[-] [{d_idx}/{len(chunk)}] Unexpected error on {domain}: {e}")
 
                       await context.close()
                       await browser.close()
@@ -364,7 +412,7 @@ jobs:
           asyncio.run(main())
 
       # ==========================================
-      # 5. ВЫГРУЗКА
+      # UPLOAD
       # ==========================================
       - name: Upload Clean QUIC Dumps
         uses: actions/upload-artifact@v4
@@ -373,22 +421,42 @@ jobs:
           path: dumps/
 
   # ============================================================================
-  # 6. АГРЕГАЦИЯ В 1 ОБЩИЙ АРХИВ
+  # 2. АГРЕГАЦИЯ В 1 АРХИВ
   # ============================================================================
   aggregate:
     name: Combine All Dumps into Single Archive
     needs: capture
     runs-on: ubuntu-latest
     steps:
-      - name: Download all browser artifacts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Скачиваем текущий дамп (например yandex_win)
+      - name: Download current run artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: raw-dumps-*
           path: unified_dumps
           merge-multiple: true
 
+      # Подтягиваем дампы остальных 11 браузеров из прошлого запуска
+      - name: Pull missing artifacts from previous run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p unified_dumps/tier1 unified_dumps/tier2
+          PREV_RUN_ID=$(gh run list --workflow="${{ github.workflow }}" --limit 2 --json databaseId --jq '.[1].databaseId')
+          if [ -n "$PREV_RUN_ID" ] && [ "$PREV_RUN_ID" != "null" ]; then
+            echo "[*] Downloading from previous run: $PREV_RUN_ID"
+            gh run download "$PREV_RUN_ID" --pattern "raw-dumps-*" --dir prev_dumps || true
+            if [ -d "prev_dumps" ]; then
+              cp -rn prev_dumps/*/* unified_dumps/ || true
+            fi
+          fi
+
       - name: Upload Unified Archive
         uses: actions/upload-artifact@v4
         with:
           name: quic-clean-dumps-all
-          path: unified_dumps/
+          path: u
