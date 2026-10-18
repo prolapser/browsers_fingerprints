@@ -20,14 +20,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump tshark curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump curl
 
           # Edge
           curl -fSsL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor | sudo tee /usr/share/keyrings/microsoft.gpg > /dev/null
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
           sudo apt-get update && sudo apt-get install -y microsoft-edge-stable
 
-          # Yandex
+          # Yandex Browser
           curl -L -A "Mozilla/5.0" -o yandex.deb "https://browser.yandex.ru/download?os=linux&package=deb&x64=1"
           sudo apt-get install -y ./yandex.deb || sudo apt-get -f install -y
 
@@ -42,7 +42,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          choco install wireshark -y
+          # Wireshark/Npcap НЕ ставим — используем встроенный в Windows pktmon
           choco install firefox -y
 
           # Yandex Browser
@@ -63,7 +63,7 @@ jobs:
           python -m playwright install firefox chromium webkit
 
       # ==========================================
-      # 4. ЗАПУСК СКРИПТА ЗАХВАТА (УНИВЕРСАЛЬНЫЙ)
+      # 4. ЗАПУСК СКРИПТА ЗАХВАТА
       # ==========================================
       - name: Execute QUIC Capture Script
         shell: python
@@ -73,17 +73,16 @@ jobs:
           import sys
           import time
           import subprocess
-          import glob
           from playwright.async_api import async_playwright
           from scapy.all import rdpcap, UDP
 
           os_name = sys.platform  # 'linux', 'win32', 'darwin'
-          target_domain = "ya.ru"
-          target_url = f"https://{target_domain}"
+          
+          # Пул целей из белого списка
+          target_domains = ["ya.ru", "01.img.avito.st", "cdn.tbank.ru", "sun2-16.userapi.com"]
           dump_dir = "dumps"
           os.makedirs(dump_dir, exist_ok=True)
 
-          # Определение путей к браузерам
           browsers = {}
 
           if os_name == "linux":
@@ -121,113 +120,142 @@ jobs:
 
           def start_sniffer(pcap_path):
               if os_name == "win32":
-                  etl_path = pcap_path.replace(".pcapng", ".etl")
+                  etl_path = pcap_path.replace(".pcap", ".etl")
                   subprocess.run(["pktmon", "stop"], capture_output=True)
                   subprocess.run(["pktmon", "filter", "remove"], capture_output=True)
                   subprocess.run(["pktmon", "filter", "add", "-p", "443", "-t", "UDP"], capture_output=True)
                   subprocess.run(["pktmon", "start", "-c", "--pkt-size", "0", "-f", etl_path], capture_output=True)
                   return None
               elif os_name == "darwin":
-                  return subprocess.Popen(["sudo", "tcpdump", "-i", "en0", "-U", "-w", pcap_path, "udp port 443"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  return subprocess.Popen(
+                      ["sudo", "tcpdump", "-i", "en0", "-U", "-w", pcap_path, "udp port 443"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
+                  )
               else:
-                  return subprocess.Popen(["sudo", "tcpdump", "-i", "any", "-U", "-w", pcap_path, "udp port 443"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  return subprocess.Popen(
+                      ["sudo", "tcpdump", "-i", "any", "-U", "-w", pcap_path, "udp port 443"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
+                  )
 
           def stop_sniffer(proc, pcap_path):
               time.sleep(1)
               if os_name == "win32":
-                  etl_path = pcap_path.replace(".pcapng", ".etl")
+                  etl_path = pcap_path.replace(".pcap", ".etl")
                   subprocess.run(["pktmon", "stop"], capture_output=True)
-                  subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True)
+                  # Пробуем etl2pcap, если не найден — pcapng (зависит от версии сборки Windows)
+                  res = subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True)
+                  if not os.path.exists(pcap_path):
+                      subprocess.run(["pktmon", "pcapng", etl_path, "-o", pcap_path], capture_output=True)
               else:
+                  if proc:
+                      try:
+                          proc.terminate()
+                          proc.wait(timeout=3)
+                      except:
+                          proc.kill()
                   subprocess.run(["sudo", "killall", "-2", "tcpdump"], check=False)
               time.sleep(1)
 
-          def extract_hex(pcap_path):
+          def extract_clean_quic_hex(pcap_path):
+              """Извлекает строго чистый UDP Payload пакета QUIC Initial"""
               if not os.path.exists(pcap_path):
                   return None
               try:
                   packets = rdpcap(pcap_path)
                   for p in packets:
-                      # Ищем первый исходящий пакет клиента на порт 443 (Initial)
                       if p.haslayer(UDP) and p[UDP].dport == 443:
-                          return bytes(p).hex()
+                          payload = bytes(p[UDP].payload)
+                          # Критерии RFC 9000 QUIC Client Initial:
+                          # 1. Размер фрейма >= 1200 байт
+                          # 2. Старший бит Header Form = 1 (Long Header): (payload[0] & 0x80) != 0
+                          # 3. Packet Type = 0x00 (Initial): (payload[0] & 0x30) == 0x00
+                          if len(payload) >= 1200 and (payload[0] & 0x80) != 0:
+                              if (payload[0] & 0x30) == 0x00:
+                                  return payload.hex()
               except Exception as e:
-                  print(f"Error reading pcap: {e}")
+                  print(f"[-] Error parsing pcap {pcap_path}: {e}")
               return None
 
-          async def run_capture():
+          async def capture_browser(p, name, cfg):
+              b_type = cfg["type"]
+              b_path = cfg["path"]
+
+              if b_path and not os.path.exists(b_path):
+                  print(f"[-] Skipping {name}: binary not found at {b_path}")
+                  return
+
+              print(f"\n==========================================")
+              print(f"[*] Processing: {name} ({b_type})")
+
+              pcap_file = os.path.abspath(f"{name}.pcap")
+
+              for domain in target_domains:
+                  if os.path.exists(pcap_file):
+                      os.remove(pcap_file)
+
+                  target_url = f"https://{domain}"
+                  print(f"[*] Probing {domain}...")
+
+                  sniff_proc = start_sniffer(pcap_file)
+                  time.sleep(1.5)
+
+                  try:
+                      launch_opts = {"headless": True}
+                      if b_path:
+                          launch_opts["executable_path"] = b_path
+
+                      if b_type == "chromium":
+                          launch_opts["args"] = [
+                              "--no-sandbox",
+                              "--enable-quic",
+                              "--quic-version=h3",
+                              f"--origin-to-force-quic-on={domain}:443"
+                          ]
+                          browser = await p.chromium.launch(**launch_opts)
+                      elif b_type == "firefox":
+                          launch_opts["firefox_user_prefs"] = {
+                              "network.http.http3.enable": True,
+                              "network.http.http3.alt-svc-mapping-for-testing": f"{domain};h3=\":443\""
+                          }
+                          browser = await p.firefox.launch(**launch_opts)
+                      else:
+                          browser = await p.webkit.launch(**launch_opts)
+
+                      page = await browser.new_page()
+                      try:
+                          await page.goto(target_url, timeout=7000)
+                      except:
+                          pass
+                      await browser.close()
+                  except Exception as e:
+                      print(f"[-] Browser execution error for {name}: {e}")
+                  finally:
+                      stop_sniffer(sniff_proc, pcap_file)
+
+                  hex_data = extract_clean_quic_hex(pcap_file)
+                  if hex_data:
+                      out_file = os.path.join(dump_dir, f"{name}_{domain}_initial.hex")
+                      with open(out_file, "w", encoding="ascii") as f:
+                          f.write(hex_data)
+                      print(f"[+] SUCCESS: {name} captured on {domain}! Clean UDP payload length: {len(hex_data)//2} bytes")
+                      break
+                  else:
+                      print(f"[-] No QUIC Initial on {domain}, falling back to next domain...")
+
+          async def main():
               async with async_playwright() as p:
                   for name, cfg in browsers.items():
-                      b_type = cfg["type"]
-                      b_path = cfg["path"]
+                      await capture_browser(p, name, cfg)
 
-                      if b_path and not os.path.exists(b_path):
-                          print(f"[-] Skipping {name}: path {b_path} not found.")
-                          continue
-
-                      print(f"\n==========================================")
-                      print(f"[*] Capturing: {name} ({b_type})")
-
-                      ext = ".pcapng" if os_name == "win32" else ".pcap"
-                      pcap_file = os.path.abspath(f"{name}{ext}")
-                      if os.path.exists(pcap_file):
-                          os.remove(pcap_file)
-
-                      # 1. Старт захвата
-                      sniff_proc = start_sniffer(pcap_file)
-                      time.sleep(1)
-
-                      # 2. Запуск браузера с HTTP/3 флагами через Playwright CDP
-                      try:
-                          launch_opts = {"headless": True}
-                          if b_path:
-                              launch_opts["executable_path"] = b_path
-
-                          if b_type == "chromium":
-                              launch_opts["args"] = [
-                                  "--no-sandbox",
-                                  "--enable-quic",
-                                  "--quic-version=h3",
-                                  f"--origin-to-force-quic-on={target_domain}:443"
-                              ]
-                              browser = await p.chromium.launch(**launch_opts)
-                          elif b_type == "firefox":
-                              launch_opts["firefox_user_prefs"] = {
-                                  "network.http.http3.enable": True,
-                                  "network.http.http3.alt-svc-mapping-for-testing": f"{target_domain};h3=\":443\""
-                              }
-                              browser = await p.firefox.launch(**launch_opts)
-                          else:
-                              browser = await p.webkit.launch(**launch_opts)
-
-                          page = await browser.new_page()
-                          try:
-                              await page.goto(target_url, timeout=7000)
-                          except:
-                              pass
-                          await browser.close()
-                      except Exception as e:
-                          print(f"[-] Browser run failed: {e}")
-                      finally:
-                          stop_sniffer(sniff_proc, pcap_file)
-
-                      # 3. Извлечение дампа
-                      hex_data = extract_hex(pcap_file)
-                      if hex_data:
-                          out_file = os.path.join(dump_dir, f"{name}_initial_hex.txt")
-                          with open(out_file, "w", encoding="ascii") as f:
-                              f.write(hex_data)
-                          print(f"[+] SUCCESS: {name} captured! Hex len: {len(hex_data)}")
-                      else:
-                          print(f"[-] FAILED to extract UDP 443 Initial for {name}")
-
-          asyncio.run(run_capture())
+          asyncio.run(main())
 
       # ==========================================
-      # 5. ВЫГРУЗКА АРТЕФАКТОВ
+      # 5. ВЫГРУЗКА ЧИСТЫХ HEX-АРТЕФАКТОВ
       # ==========================================
-      - name: Upload Dumps Artifact
+      - name: Upload Clean QUIC Dumps
         uses: actions/upload-artifact@v4
         with:
-          name: quic-dumps-${{ matrix.os }}
-          path: dumps/*.txt
+          name: quic-clean-dumps-${{ matrix.os }}
+          path: dumps/*.hex
