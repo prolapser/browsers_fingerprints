@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux (4 параллельных воркера)
+          # Linux
           - os: ubuntu-latest
             browser_id: chrome_linux
           - os: ubuntu-latest
@@ -21,7 +21,7 @@ jobs:
           - os: ubuntu-latest
             browser_id: firefox_linux
 
-          # Windows (4 параллельных воркера)
+          # Windows
           - os: windows-latest
             browser_id: chrome_win
           - os: windows-latest
@@ -31,7 +31,7 @@ jobs:
           - os: windows-latest
             browser_id: firefox_win
 
-          # macOS (4 параллельных воркера)
+          # macOS
           - os: macos-latest
             browser_id: chrome_mac
           - os: macos-latest
@@ -46,9 +46,9 @@ jobs:
         uses: actions/checkout@v4
 
       # ==========================================
-      # 1. ПОДГОТОВКА СРЕДЫ: LINUX
+      # 1. LINUX SETUP
       # ==========================================
-      - name: Setup Common Tools (Linux)
+      - name: Setup Tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -74,9 +74,9 @@ jobs:
           python -m playwright install --with-deps firefox
 
       # ==========================================
-      # 2. ПОДГОТОВКА СРЕДЫ: WINDOWS
+      # 2. WINDOWS SETUP
       # ==========================================
-      - name: Setup Common Tools (Windows)
+      - name: Setup Tools (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -86,7 +86,7 @@ jobs:
         if: matrix.browser_id == 'firefox_win'
         shell: powershell
         run: |
-          choco install firefox -y
+          python -m playwright install firefox
 
       - name: Setup Yandex (Windows)
         if: matrix.browser_id == 'yandex_win'
@@ -97,9 +97,9 @@ jobs:
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
 
       # ==========================================
-      # 3. ПОДГОТОВКА СРЕДЫ: MACOS
+      # 3. MACOS SETUP
       # ==========================================
-      - name: Setup Common Tools (macOS)
+      - name: Setup Tools (macOS)
         if: runner.os == 'macOS'
         run: |
           pip install playwright scapy
@@ -115,7 +115,7 @@ jobs:
           python -m playwright install firefox chromium webkit
 
       # ==========================================
-      # 4. ЗАПУСК СКРИПТА ЗАХВАТА
+      # 4. CAPTURE SCRIPT
       # ==========================================
       - name: Execute QUIC Capture Script
         env:
@@ -130,9 +130,8 @@ jobs:
           from playwright.async_api import async_playwright
           from scapy.all import rdpcap, UDP
 
-          os_name = sys.platform  # 'linux', 'win32', 'darwin'
+          os_name = sys.platform
           target_browser = os.environ.get("TARGET_BROWSER")
-          
           dump_dir = "dumps"
           tiers = {"tier1": [], "tier2": []}
 
@@ -146,7 +145,6 @@ jobs:
                   print(f"[!] Warning: {filename} not found!")
 
           browsers = {}
-
           if os_name == "linux":
               browsers = {
                   "chrome_linux": {"type": "chromium", "path": "/usr/bin/google-chrome"},
@@ -170,7 +168,7 @@ jobs:
                   "chrome_win": {"type": "chromium", "path": os.path.join(prog_files, "Google", "Chrome", "Application", "chrome.exe")},
                   "edge_win": {"type": "chromium", "path": os.path.join(prog_files_x86, "Microsoft", "Edge", "Application", "msedge.exe")},
                   "yandex_win": {"type": "chromium", "path": yandex_exe},
-                  "firefox_win": {"type": "firefox", "path": os.path.join(prog_files, "Mozilla Firefox", "firefox.exe")}
+                  "firefox_win": {"type": "firefox", "path": None}  # Используем Playwright Firefox
               }
           elif os_name == "darwin":
               browsers = {
@@ -181,10 +179,23 @@ jobs:
               }
 
           if target_browser not in browsers:
-              print(f"[-] Browser {target_browser} is not defined for {os_name}")
+              print(f"[-] Unknown browser {target_browser}")
               sys.exit(1)
 
           cfg = browsers[target_browser]
+
+          # Определение дефолтного сетевого интерфейса на macOS
+          macos_iface = "en0"
+          if os_name == "darwin":
+              try:
+                  route_out = subprocess.check_output(["route", "-n", "get", "default"], text=True)
+                  for line in route_out.splitlines():
+                      if "interface:" in line:
+                          macos_iface = line.split(":")[1].strip()
+                          break
+              except Exception:
+                  pass
+              print(f"[*] Detected macOS default interface: {macos_iface}")
 
           def start_sniffer(pcap_path):
               if os_name == "win32":
@@ -196,42 +207,42 @@ jobs:
                   return None
               elif os_name == "darwin":
                   return subprocess.Popen(
-                      ["sudo", "tcpdump", "-i", "en0", "-U", "-w", pcap_path, "udp port 443"],
+                      ["sudo", "tcpdump", "-i", macos_iface, "-n", "-U", "-w", pcap_path, "udp port 443"],
                       stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL
                   )
               else:
                   return subprocess.Popen(
-                      ["sudo", "tcpdump", "-i", "any", "-U", "-w", pcap_path, "udp port 443"],
+                      ["sudo", "tcpdump", "-i", "any", "-n", "-U", "-w", pcap_path, "udp port 443"],
                       stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL
                   )
 
           def stop_sniffer(proc, pcap_path):
-              time.sleep(0.3)
+              time.sleep(0.15)
               if os_name == "win32":
                   etl_path = pcap_path.replace(".pcap", ".etl")
                   subprocess.run(["pktmon", "stop"], capture_output=True)
-                  res = subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True)
+                  subprocess.run(["pktmon", "etl2pcap", etl_path, "--out", pcap_path], capture_output=True)
                   if not os.path.exists(pcap_path):
                       subprocess.run(["pktmon", "pcapng", etl_path, "-o", pcap_path], capture_output=True)
               else:
                   if proc:
                       try:
                           proc.terminate()
-                          proc.wait(timeout=2)
+                          proc.wait(timeout=1.5)
                       except Exception:
                           try:
                               proc.kill()
                           except Exception:
                               pass
-                  # Заглушаем вывод killall, если процесс уже был корректно завершен
-                  subprocess.run(
-                      ["sudo", "killall", "-2", "tcpdump"],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL,
-                      check=False
-                  )
+                  if proc and proc.poll() is None:
+                      subprocess.run(
+                          ["sudo", "killall", "-9", "tcpdump"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          check=False
+                      )
 
           def extract_clean_quic_hex(pcap_path):
               if not os.path.exists(pcap_path):
@@ -244,9 +255,13 @@ jobs:
                           if len(payload) >= 1200 and (payload[0] & 0x80) != 0:
                               if (payload[0] & 0x30) == 0x00:
                                   return payload.hex()
-              except Exception as e:
-                  print(f"[-] Error parsing pcap {pcap_path}: {e}")
+              except Exception:
+                  pass
               return None
+
+          def chunk_list(lst, n):
+              for i in range(0, len(lst), n):
+                  yield lst[i:i + n]
 
           async def capture_browser(p, name, cfg):
               b_type = cfg["type"]
@@ -256,9 +271,7 @@ jobs:
                   print(f"[-] Skipping {name}: binary not found at {b_path}")
                   return
 
-              print(f"\n==========================================")
               print(f"[*] Processing: {name} ({b_type})")
-
               pcap_file = os.path.abspath(f"{name}.pcap")
               etl_file = pcap_file.replace(".pcap", ".etl")
 
@@ -266,62 +279,78 @@ jobs:
                   tier_dir = os.path.join(dump_dir, tier_key)
                   os.makedirs(tier_dir, exist_ok=True)
 
-                  print(f"[*] Starting {tier_key} ({len(domains)} domains) for {name}")
+                  if not domains:
+                      continue
 
-                  for idx, domain in enumerate(domains, 1):
-                      if os.path.exists(pcap_file):
-                          os.remove(pcap_file)
-                      if os.path.exists(etl_file):
-                          os.remove(etl_file)
+                  print(f"\n[*] Starting {tier_key} ({len(domains)} domains)")
+                  
+                  # Чанки по 300 доменов, чтобы браузер не перезапускался 950 раз
+                  # и не превышался лимит длины аргументов командной строки (32KB на Windows)
+                  for chunk_idx, chunk in enumerate(chunk_list(domains, 300), 1):
+                      print(f"[*] Launching browser for chunk {chunk_idx} ({len(chunk)} domains)...")
 
-                      target_url = f"https://{domain}"
-                      print(f"[{idx}/{len(domains)}] [{tier_key}] Probing {domain}...")
+                      launch_opts = {"headless": True}
+                      if b_path:
+                          launch_opts["executable_path"] = b_path
 
-                      sniff_proc = start_sniffer(pcap_file)
-                      time.sleep(0.3)
-
-                      try:
-                          launch_opts = {"headless": True}
-                          if b_path:
-                              launch_opts["executable_path"] = b_path
-
-                          if b_type == "chromium":
-                              launch_opts["args"] = [
-                                  "--no-sandbox",
-                                  "--enable-quic",
-                                  "--quic-version=h3",
-                                  f"--origin-to-force-quic-on={domain}:443"
-                              ]
-                              browser = await p.chromium.launch(**launch_opts)
-                          elif b_type == "firefox":
-                              launch_opts["firefox_user_prefs"] = {
-                                  "network.http.http3.enable": True,
-                                  "network.http.http3.alt-svc-mapping-for-testing": f"{domain};h3=\":443\""
-                              }
-                              browser = await p.firefox.launch(**launch_opts)
-                          else:
-                              browser = await p.webkit.launch(**launch_opts)
-
-                          page = await browser.new_page()
-                          try:
-                              await page.goto(target_url, timeout=4000)
-                          except:
-                              pass
-                          await browser.close()
-                      except Exception as e:
-                          print(f"[-] Browser execution error for {name}: {e}")
-                      finally:
-                          stop_sniffer(sniff_proc, pcap_file)
-
-                      hex_data = extract_clean_quic_hex(pcap_file)
-                      if hex_data:
-                          filename = f"{os_name}_{name}_{domain}_initial.hex"
-                          out_file = os.path.join(tier_dir, filename)
-                          with open(out_file, "w", encoding="ascii") as f:
-                              f.write(hex_data)
-                          print(f"[+] SUCCESS: {domain} ({len(hex_data)//2} bytes) -> {filename}")
+                      if b_type == "chromium":
+                          quic_origins = ",".join([f"{d}:443" for d in chunk])
+                          launch_opts["args"] = [
+                              "--no-sandbox",
+                              "--enable-quic",
+                              "--quic-version=h3",
+                              f"--origin-to-force-quic-on={quic_origins}"
+                          ]
+                          browser = await p.chromium.launch(**launch_opts)
+                      elif b_type == "firefox":
+                          alt_svc = ",".join([f'{d};h3=":443"' for d in chunk])
+                          launch_opts["firefox_user_prefs"] = {
+                              "network.http.http3.enable": True,
+                              "network.http.http3.alt-svc-mapping-for-testing": alt_svc
+                          }
+                          browser = await p.firefox.launch(**launch_opts)
                       else:
-                          print(f"[-] No QUIC Initial on {domain}")
+                          browser = await p.webkit.launch(**launch_opts)
+
+                      context = await browser.new_context(ignore_https_errors=True)
+
+                      for d_idx, domain in enumerate(chunk, 1):
+                          if os.path.exists(pcap_file):
+                              try: os.remove(pcap_file)
+                              except: pass
+                          if os.path.exists(etl_file):
+                              try: os.remove(etl_file)
+                              except: pass
+
+                          target_url = f"https://{domain}"
+                          sniff_proc = start_sniffer(pcap_file)
+                          time.sleep(0.1)
+
+                          try:
+                              page = await context.new_page()
+                              try:
+                                  # 1500ms достаточно, Initial улетает в первые миллисекунды
+                                  await page.goto(target_url, timeout=1500)
+                              except Exception:
+                                  pass
+                              await page.close()
+                          except Exception as e:
+                              print(f"[-] Page error on {domain}: {e}")
+                          finally:
+                              stop_sniffer(sniff_proc, pcap_file)
+
+                          hex_data = extract_clean_quic_hex(pcap_file)
+                          if hex_data:
+                              filename = f"{os_name}_{name}_{domain}_initial.hex"
+                              out_file = os.path.join(tier_dir, filename)
+                              with open(out_file, "w", encoding="ascii") as f:
+                                  f.write(hex_data)
+                              print(f"[+] [{d_idx}/{len(chunk)}] SUCCESS: {domain} ({len(hex_data)//2} B) -> {filename}")
+                          else:
+                              print(f"[-] [{d_idx}/{len(chunk)}] No QUIC Initial on {domain}")
+
+                      await context.close()
+                      await browser.close()
 
           async def main():
               async with async_playwright() as p:
@@ -330,7 +359,7 @@ jobs:
           asyncio.run(main())
 
       # ==========================================
-      # 5. ВЫГРУЗКА ДАМПОВ КОНКРЕТНОГО БРАУЗЕРА
+      # 5. ВЫГРУЗКА
       # ==========================================
       - name: Upload Clean QUIC Dumps
         uses: actions/upload-artifact@v4
@@ -339,7 +368,7 @@ jobs:
           path: dumps/
 
   # ============================================================================
-  # 6. АГРЕГАЦИЯ: СБОР ВСЕХ 12 БРАУЗЕРОВ В ЕДИНЫЙ АРХИВ (tier1/ и tier2/)
+  # 6. АГРЕГАЦИЯ В 1 АРХИВ
   # ============================================================================
   aggregate:
     name: Combine All Dumps into Single Archive
