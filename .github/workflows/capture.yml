@@ -1,173 +1,143 @@
-name: Capture Windows Browsers QUIC
+name: Capture Browsers QUIC Profiles (Linux)
 
 on:
   workflow_dispatch:
 
 jobs:
-  capture-windows:
-    name: Windows QUIC Profile Capture
-    runs-on: windows-latest
-    env:
-      PYTHONIOENCODING: "utf-8"
+  capture:
+    runs-on: ubuntu-latest
     steps:
-      - name: Install Wireshark and Firefox
-        shell: powershell
+      - name: Install Tools, Edge and Yandex Browser
         run: |
-          choco install wireshark -y
-          choco install firefox -y
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark tcpdump curl
 
-      - name: Download & Install Yandex Browser
-        shell: powershell
-        run: |
-          $installer = "$env:TEMP\YandexSetup.exe"
-          Write-Host "[*] Downloading Yandex Browser..."
-          
-          curl.exe -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" `
-            -o $installer `
-            "https://browser.yandex.ru/download?os=win&bitness=64&banerid=6302000000"
+          # 1. Установка Microsoft Edge
+          curl -fSsL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor | sudo tee /usr/share/keyrings/microsoft.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
+          sudo apt-get update
+          sudo apt-get install -y microsoft-edge-stable
 
-          Write-Host "[*] Installing Yandex Browser..."
-          Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
-          
-          $timer = 30
-          while (-not (Test-Path "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe") -and -not (Test-Path "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe") -and $timer -gt 0) {
-              Start-Sleep -Seconds 2
-              $timer -= 2
-          }
+          # 2. Установка Яндекс Браузера
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o yandex.deb "https://browser.yandex.ru/download?os=linux&package=deb&x64=1"
+          sudo apt-get install -y ./yandex.deb
+
+          # 3. Установка автономного Firefox через Playwright (чтобы избежать snap-контейнеров Ubuntu)
+          pip install playwright
+          python -m playwright install firefox
 
       - name: Run QUIC Capture
-        shell: powershell
         run: |
-          $pythonScript = @'
-          import os, sys, time, subprocess, tempfile
+          cat << 'EOF' > capture.py
+          import os, sys, time, subprocess, tempfile, glob
 
-          tshark = r'C:\Program Files\Wireshark\tshark.exe'
-          if not os.path.exists(tshark):
-              print('[-] Error: tshark not found at:', tshark)
-              sys.exit(1)
-
-          local_app = os.environ.get('LOCALAPPDATA', '')
-          prog_files = os.environ.get('ProgramFiles', r'C:\Program Files')
-          prog_files_x86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
-
-          yandex_candidates = [
-              os.path.join(local_app, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe'),
-              os.path.join(prog_files_x86, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe'),
-              os.path.join(prog_files, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe')
-          ]
-          yandex_exe = next((p for p in yandex_candidates if os.path.exists(p)), None)
+          # Ищем путь к установленному Playwright Firefox
+          ff_pattern = os.path.expanduser("~/.cache/ms-playwright/firefox-*/firefox/firefox")
+          ff_matches = glob.glob(ff_pattern)
+          firefox_bin = ff_matches[0] if ff_matches else "/usr/bin/firefox"
 
           browsers = {
-              'chrome': os.path.join(prog_files, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-              'edge': os.path.join(prog_files_x86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-              'firefox': os.path.join(prog_files, 'Mozilla Firefox', 'firefox.exe'),
-              'yandex': yandex_exe
+              "chrome": "/usr/bin/google-chrome",
+              "edge": "/usr/bin/microsoft-edge",
+              "yandex": "/usr/bin/yandex-browser",
+              "firefox": firefox_bin
           }
 
-          os.makedirs('dumps', exist_ok=True)
-          domain = 'ya.ru'
-          target_url = f'https://{domain}'
+          os.makedirs("dumps", exist_ok=True)
+          domain = "ya.ru"
+          target_url = f"https://{domain}"
           temp_dir = tempfile.gettempdir()
 
           for name, exe in browsers.items():
-              print(f'\n===============================================')
-              print(f'[*] Testing browser: {name}')
+              print(f"\n===============================================")
+              print(f"[*] Testing browser: {name}")
+              print(f"Binary path: {exe}")
 
-              if not exe or not os.path.exists(exe):
-                  print(f'[-] {name} executable not found, skipping.')
+              if not os.path.exists(exe):
+                  print(f"[-] {name} binary not found, skipping.")
                   continue
 
-              print(f'Path: {exe}')
-              etl_path = os.path.join(temp_dir, f'{name}.etl')
-              pcapng_path = os.path.join(temp_dir, f'{name}.pcapng')
+              pcap_path = os.path.join(temp_dir, f"{name}.pcap")
+              if os.path.exists(pcap_path):
+                  os.remove(pcap_path)
 
-              for f in [etl_path, pcapng_path]:
-                  if os.path.exists(f):
-                      try: os.remove(f)
-                      except: pass
+              # 1. Запуск tcpdump на интерфейсе "any"
+              dump_cmd = [
+                  "sudo", "tcpdump", "-i", "any", "-U",
+                  "-w", pcap_path,
+                  "udp and port 443"
+              ]
+              sniffer = subprocess.Popen(dump_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              time.sleep(1)
 
-              # 1. Сброс и настройка pktmon на захват порта 443
-              subprocess.run(['pktmon', 'stop'], capture_output=True)
-              subprocess.run(['pktmon', 'filter', 'remove'], capture_output=True)
-              subprocess.run(['pktmon', 'filter', 'add', '-p', '443'], capture_output=True)
+              # 2. Запуск браузера с принудительным HTTP/3
+              prof_dir = os.path.join(temp_dir, f"prof_{name}")
+              os.makedirs(prof_dir, exist_ok=True)
 
-              # 2. Запуск захвата пакетов
-              subprocess.run(['pktmon', 'start', '--pkt-size', '0', '-f', etl_path], capture_output=True)
-              time.sleep(2)
-
-              # 3. Подготовка профиля и запуск браузера с ПРИНУДИТЕЛЬНЫМ QUIC
-              profile_dir = os.path.join(temp_dir, f'prof_{name}')
-              os.makedirs(profile_dir, exist_ok=True)
-
-              if name == 'firefox':
-                  # Для Firefox создаем user.js с эмуляцией alt-svc для ya.ru
-                  user_js = os.path.join(profile_dir, 'user.js')
-                  with open(user_js, 'w') as f:
+              if name == "firefox":
+                  # Создаем user.js для Firefox с маппингом Alt-Svc
+                  user_js = os.path.join(prof_dir, "user.js")
+                  with open(user_js, "w") as f:
                       f.write('user_pref("network.http.http3.enable", true);\n')
                       f.write(f'user_pref("network.http.http3.alt-svc-mapping-for-testing", "{domain};h3=\\\":443\\\"");\n')
                   
-                  proc = subprocess.Popen([exe, '-headless', '-profile', profile_dir, '-url', target_url])
+                  proc = subprocess.Popen([exe, "-headless", "-profile", prof_dir, "-url", target_url])
               else:
-                  # Для Chromium-браузеров жестко форсируем QUIC на домен
+                  # Запуск Chromium c флагом --no-sandbox (ОБЯЗАТЕЛЬНО) и форсированием QUIC
                   proc = subprocess.Popen([
                       exe,
-                      '--headless=new',
-                      '--disable-gpu',
-                      '--enable-quic',
-                      '--quic-version=h3',
-                      f'--origin-to-force-quic-on={domain}:443',
-                      f'--user-data-dir={profile_dir}',
+                      "--no-sandbox",
+                      "--headless=new",
+                      "--disable-gpu",
+                      "--enable-quic",
+                      "--quic-version=h3",
+                      f"--origin-to-force-quic-on={domain}:443",
+                      f"--user-data-dir={prof_dir}",
                       target_url
                   ])
 
-              # Ждем 8 секунд генерации рукопожатия
-              time.sleep(8)
+              time.sleep(6)
 
-              # 4. Останавливаем браузер и сниффер
+              # 3. Остановка процессов
               try: proc.kill()
               except: pass
               
-              subprocess.run(['pktmon', 'stop'], capture_output=True)
+              subprocess.run(["sudo", "killall", "-2", "tcpdump"], check=False)
+              time.sleep(1)
 
-              # 5. Конвертируем дамп в PCAPNG
-              conv = subprocess.run(['pktmon', 'etl2pcap', etl_path, '--out', pcapng_path], capture_output=True, text=True)
-              print(f'[+] Pktmon export: {conv.stdout.strip()}')
-
-              # 6. Извлекаем Initial пакеты через tshark
-              if os.path.exists(pcapng_path):
+              # 4. Извлечение Initial пакета через tshark
+              if os.path.exists(pcap_path):
                   cmd = [
-                      tshark, '-r', pcapng_path,
-                      '-Y', 'quic && quic.header_form == 1 && quic.long.packet_type == 0',
-                      '-T', 'fields', '-e', 'frame.raw'
+                      "tshark", "-r", pcap_path,
+                      "-Y", "quic && quic.header_form == 1 && quic.long.packet_type == 0",
+                      "-T", "fields", "-e", "frame.raw"
                   ]
                   res = subprocess.run(cmd, capture_output=True, text=True)
                   lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-                  
+
                   if lines:
                       first_initial = lines[0]
-                      out_file = os.path.join('dumps', f'{name}_initial_hex.txt')
-                      with open(out_file, 'w', encoding='ascii') as f:
+                      out_file = os.path.join("dumps", f"{name}_initial_hex.txt")
+                      with open(out_file, "w", encoding="ascii") as f:
                           f.write(first_initial)
-                      print(f'[+] SUCCESS: {name} Initial packet captured! (Hex length: {len(first_initial)})')
+                      print(f"[+] SUCCESS: {name} Initial packet captured! (Hex len: {len(first_initial)})")
                       continue
                   else:
-                      # Диагностика: проверим вообще были ли UDP пакеты
-                      chk = subprocess.run([tshark, '-r', pcapng_path, '-Y', 'udp', '-c', '5'], capture_output=True, text=True)
+                      # Диагностика
+                      chk = subprocess.run(["tshark", "-r", pcap_path, "-Y", "udp", "-c", "2"], capture_output=True, text=True)
                       if chk.stdout.strip():
-                          print(f'[-] UDP packets were seen, but QUIC Initial was not recognized.')
+                          print("[-] UDP seen, but QUIC Initial filter did not match.")
                       else:
-                          print(f'[-] No UDP traffic on port 443 was captured.')
+                          print("[-] No UDP traffic on port 443 recorded.")
 
-              print(f'[-] Failed to capture Initial packet for {name}')
+              print(f"[-] Failed to capture Initial packet for {name}")
 
-          subprocess.run(['pktmon', 'filter', 'remove'], capture_output=True)
-          '@
+          EOF
 
-          Set-Content -Path script.py -Value $pythonScript
-          python script.py
+          python capture.py
 
-      - name: Upload Windows Browser Dumps
+      - name: Upload Browser Dumps
         uses: actions/upload-artifact@v4
         with:
-          name: windows-browser-dumps
+          name: browser-quic-dumps
           path: dumps/*.txt
