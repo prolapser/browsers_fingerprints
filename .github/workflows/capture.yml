@@ -11,7 +11,6 @@ jobs:
       - name: Install Wireshark and Firefox
         shell: powershell
         run: |
-          # Установка tshark и Firefox через Chocolatey
           choco install wireshark -y --params "/AddToPath"
           choco install firefox -y
 
@@ -21,106 +20,130 @@ jobs:
           $installer = "$env:TEMP\YandexSetup.exe"
           Write-Host "[*] Скачивание Яндекс Браузера..."
           
-          # Скачиваем официальным curl.exe с переходом по 302 редиректам
           curl.exe -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" `
             -o $installer `
             "https://browser.yandex.ru/download?os=win&bitness=64&banerid=6302000000"
 
-          Write-Host "[*] Тихая установка Яндекс Браузера..."
+          Write-Host "[*] Установка Яндекс Браузера..."
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
-          Start-Sleep -Seconds 10
-
-      - name: Capture QUIC Initial Hex Streams
-        shell: powershell
-        run: |
-          $env:Path += ";C:\Program Files\Wireshark"
-
-          # Ищем путь к Яндекс Браузеру (он может встать в LocalAppData или в Program Files)
-          $yandexPaths = @(
+          
+          # Даем установщику до 30 секунд завершить фоновое развертывание
+          $paths = @(
               "$env:LOCALAPPDATA\Yandex\YandexBrowser\Application\browser.exe",
               "C:\Program Files (x86)\Yandex\YandexBrowser\Application\browser.exe",
               "C:\Program Files\Yandex\YandexBrowser\Application\browser.exe"
           )
-          $yandexExe = $yandexPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          $browsers = [ordered]@{
-              "chrome"  = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-              "edge"    = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-              "firefox" = "C:\Program Files\Mozilla Firefox\firefox.exe"
-              "yandex"  = $yandexExe
-          }
-
-          New-Item -ItemType Directory -Force -Path "./dumps"
-
-          foreach ($name in $browsers.Keys) {
-              $exe = $browsers[$name]
-              Write-Host "`n==============================================="
-              Write-Host "[*] Сбор дампа для: $name"
-              Write-Host "Путь: $exe"
-              Write-Host "==============================================="
-
-              if (-not $exe -or -not (Test-Path $exe)) {
-                  Write-Warning "[-] Исполняемый файл для $name не найден, пропускаем..."
-                  continue
-              }
-
-              $pcapFile = "$env:TEMP\$name.pcap"
-              if (Test-Path $pcapFile) { Remove-Item $pcapFile -Force }
-
-              # 1. Запуск tshark в фоне
-              $tsharkJob = Start-Job -ScriptBlock {
-                  param($pcap)
-                  & "C:\Program Files\Wireshark\tshark.exe" -i 1 -f "udp port 443" `
-                    -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" `
-                    -w $pcap
-              } -ArgumentList $pcapFile
-
+          $timer = 30
+          while (-not ($paths | Where-Object { Test-Path $_ }) -and $timer -gt 0) {
               Start-Sleep -Seconds 2
-
-              # 2. Запуск браузера с форсированием QUIC Initial
-              $targetUrl = "https://ya.ru"
-              $profileDir = "$env:TEMP\profile_$name"
-
-              if ($name -eq "firefox") {
-                  $process = Start-Process -FilePath $exe -ArgumentList "-headless", "-url", $targetUrl -PassThru
-              } else {
-                  $args = @(
-                      "--headless=new",
-                      "--disable-gpu",
-                      "--enable-quic",
-                      "--quic-version=h3",
-                      "--user-data-dir=$profileDir",
-                      $targetUrl
-                  )
-                  $process = Start-Process -FilePath $exe -ArgumentList $args -PassThru
-              }
-
-              Start-Sleep -Seconds 7
-
-              # 3. Закрытие браузера и остановка сниффера
-              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-              Stop-Job $tsharkJob -ErrorAction SilentlyContinue
-              Receive-Job $tsharkJob -ErrorAction SilentlyContinue
-              Remove-Job $tsharkJob -Force -ErrorAction SilentlyContinue
-
-              # 4. Извлечение первого Initial пакета в Hex Stream
-              if (Test-Path $pcapFile) {
-                  $hexStreams = & "C:\Program Files\Wireshark\tshark.exe" -r $pcapFile `
-                    -Y "quic && quic.header_form == 1 && quic.long.packet_type == 0" `
-                    -T fields -e frame.raw
-
-                  if ($hexStreams) {
-                      $firstInitial = ($hexStreams -split "`r?`n")[0].Trim()
-                      if ($firstInitial.Length -gt 0) {
-                          $outFile = "./dumps/${name}_initial_hex.txt"
-                          $firstInitial | Out-File -FilePath $outFile -Encoding ascii
-                          Write-Host "[+] УСПЕХ: $name Initial сохранен ($($firstInitial.Length) символов Hex)" -ForegroundColor Green
-                          continue
-                      }
-                  }
-              }
-              Write-Warning "[-] Не удалось перехватить Initial пакет для $name"
+              $timer -= 2
           }
+
+      - name: Run QUIC Capture (Python Runner)
+        shell: cmd
+        run: |
+          python -c "
+          import os, sys, time, subprocess, tempfile
+          from pathlib import Path
+
+          tshark = r'C:\Program Files\Wireshark\tshark.exe'
+          if not os.path.exists(tshark):
+              print('[-] Ошибка: tshark не найден по пути:', tshark)
+              sys.exit(1)
+
+          # 1. Автоматический поиск активного интерфейса Ethernet
+          ifaces_out = subprocess.check_output([tshark, '-D'], text=True)
+          chosen_iface = '1'
+          for line in ifaces_out.strip().splitlines():
+              if 'ethernet' in line.lower():
+                  chosen_iface = line.split('.')[0].strip()
+                  break
+          print(f'[+] Выбран сетевой интерфейс tshark: #{chosen_iface}')
+
+          # 2. Поиск путей к браузерам
+          local_app = os.environ.get('LOCALAPPDATA', '')
+          prog_files = os.environ.get('ProgramFiles', r'C:\Program Files')
+          prog_files_x86 = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+
+          yandex_candidates = [
+              os.path.join(local_app, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe'),
+              os.path.join(prog_files_x86, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe'),
+              os.path.join(prog_files, 'Yandex', 'YandexBrowser', 'Application', 'browser.exe')
+          ]
+          yandex_exe = next((p for p in yandex_candidates if os.path.exists(p)), None)
+
+          browsers = {
+              'chrome': os.path.join(prog_files, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+              'edge': os.path.join(prog_files_x86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+              'firefox': os.path.join(prog_files, 'Mozilla Firefox', 'firefox.exe'),
+              'yandex': yandex_exe
+          }
+
+          os.makedirs('dumps', exist_ok=True)
+          target_url = 'https://ya.ru'
+
+          for name, exe in browsers.items():
+              print(f'\n===============================================')
+              print(f'[*] Запуск теста для: {name}')
+              print(f'Путь: {exe}')
+
+              if not exe or not os.path.exists(exe):
+                  print(f'[-] Браузер {name} не найден, пропускаем.')
+                  continue
+
+              pcap_path = os.path.join(tempfile.gettempdir(), f'{name}.pcap')
+              if os.path.exists(pcap_path):
+                  os.remove(pcap_path)
+
+              # Запуск сниффера tshark
+              sniff = subprocess.Popen([
+                  tshark, '-i', chosen_iface,
+                  '-f', 'udp port 443',
+                  '-Y', 'quic && quic.header_form == 1 && quic.long.packet_type == 0',
+                  '-w', pcap_path
+              ])
+              time.sleep(2)
+
+              # Запуск браузера с принудительным HTTP/3 (QUIC)
+              profile_dir = os.path.join(tempfile.gettempdir(), f'prof_{name}')
+              if name == 'firefox':
+                  proc = subprocess.Popen([exe, '-headless', '-url', target_url])
+              else:
+                  proc = subprocess.Popen([
+                      exe,
+                      '--headless=new',
+                      '--disable-gpu',
+                      '--enable-quic',
+                      '--quic-version=h3',
+                      f'--user-data-dir={profile_dir}',
+                      target_url
+                  ])
+
+              time.sleep(8)
+
+              # Остановка процессов
+              proc.kill()
+              sniff.terminate()
+              try:
+                  sniff.wait(timeout=3)
+              except:
+                  sniff.kill()
+
+              # Извлечение Hex Stream
+              if os.path.exists(pcap_path):
+                  cmd = [tshark, '-r', pcap_path, '-Y', 'quic && quic.header_form == 1 && quic.long.packet_type == 0', '-T', 'fields', '-e', 'frame.raw']
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+                  if lines:
+                      first_initial = lines[0]
+                      out_file = os.path.join('dumps', f'{name}_initial_hex.txt')
+                      with open(out_file, 'w', encoding='ascii') as f:
+                          f.write(first_initial)
+                      print(f'[+] УСПЕХ: {name} Initial сохранен ({len(first_initial)} hex-символов)')
+                      continue
+
+              print(f'[-] Не удалось поймать Initial пакет для {name}')
+          "
 
       - name: Upload Windows Browser Dumps
         uses: actions/upload-artifact@v4
