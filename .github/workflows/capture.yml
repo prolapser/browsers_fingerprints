@@ -5,72 +5,121 @@ on:
 
 jobs:
   capture:
-    name: Capture on ${{ matrix.os }}
+    name: ${{ matrix.browser_id }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # Linux (4 параллельных воркера)
+          - os: ubuntu-latest
+            browser_id: chrome_linux
+          - os: ubuntu-latest
+            browser_id: edge_linux
+          - os: ubuntu-latest
+            browser_id: yandex_linux
+          - os: ubuntu-latest
+            browser_id: firefox_linux
+
+          # Windows (4 параллельных воркера)
+          - os: windows-latest
+            browser_id: chrome_win
+          - os: windows-latest
+            browser_id: edge_win
+          - os: windows-latest
+            browser_id: yandex_win
+          - os: windows-latest
+            browser_id: firefox_win
+
+          # macOS (4 параллельных воркера)
+          - os: macos-latest
+            browser_id: chrome_mac
+          - os: macos-latest
+            browser_id: edge_mac
+          - os: macos-latest
+            browser_id: firefox_mac
+          - os: macos-latest
+            browser_id: webkit_mac
 
     steps:
-      # ==========================================
-      # 0. КЛОНИРОВАНИЕ РЕПОЗИТОРИЯ (ДЛЯ ДОСТУПА К tier1/tier2)
-      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ==========================================
-      # 1. ПОДГОТОВКА СРЕДЫ: LINUX (UBUNTU)
+      # 1. ПОДГОТОВКА СРЕДЫ: LINUX
       # ==========================================
-      - name: Setup Linux Browsers & Tools
+      - name: Setup Common Tools (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tcpdump curl
+          pip install playwright scapy
 
-          # Edge
+      - name: Setup Edge (Linux)
+        if: matrix.browser_id == 'edge_linux'
+        run: |
           curl -fSsL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor | sudo tee /usr/share/keyrings/microsoft.gpg > /dev/null
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" | sudo tee /etc/apt/sources.list.d/microsoft-edge.list
           sudo apt-get update && sudo apt-get install -y microsoft-edge-stable
 
-          # Yandex Browser
+      - name: Setup Yandex (Linux)
+        if: matrix.browser_id == 'yandex_linux'
+        run: |
           curl -L -A "Mozilla/5.0" -o yandex.deb "https://browser.yandex.ru/download?os=linux&package=deb&x64=1"
           sudo apt-get install -y ./yandex.deb || sudo apt-get -f install -y
 
-          # Playwright & Firefox
-          pip install playwright scapy
-          python -m playwright install --with-deps firefox chromium
+      - name: Setup Firefox (Linux)
+        if: matrix.browser_id == 'firefox_linux'
+        run: |
+          python -m playwright install --with-deps firefox
 
       # ==========================================
       # 2. ПОДГОТОВКА СРЕДЫ: WINDOWS
       # ==========================================
-      - name: Setup Windows Browsers & Tools
+      - name: Setup Common Tools (Windows)
         if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          pip install playwright scapy
+
+      - name: Setup Firefox (Windows)
+        if: matrix.browser_id == 'firefox_win'
         shell: powershell
         run: |
           choco install firefox -y
 
-          # Yandex Browser
+      - name: Setup Yandex (Windows)
+        if: matrix.browser_id == 'yandex_win'
+        shell: powershell
+        run: |
           $installer = "$env:TEMP\YandexSetup.exe"
           curl.exe -L -A "Mozilla/5.0" -o $installer "https://browser.yandex.ru/download?os=win&bitness=64&banerid=6302000000"
           Start-Process -FilePath $installer -ArgumentList "--silent", "--do-not-launch-browser" -Wait
 
-          pip install playwright scapy
-
       # ==========================================
       # 3. ПОДГОТОВКА СРЕДЫ: MACOS
       # ==========================================
-      - name: Setup macOS Browsers & Tools
+      - name: Setup Common Tools (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install --cask microsoft-edge || true
           pip install playwright scapy
+
+      - name: Setup Edge (macOS)
+        if: matrix.browser_id == 'edge_mac'
+        run: |
+          brew install --cask microsoft-edge || true
+
+      - name: Setup Playwright Browsers (macOS)
+        if: matrix.browser_id == 'chrome_mac' || matrix.browser_id == 'firefox_mac' || matrix.browser_id == 'webkit_mac'
+        run: |
           python -m playwright install firefox chromium webkit
 
       # ==========================================
       # 4. ЗАПУСК СКРИПТА ЗАХВАТА
       # ==========================================
       - name: Execute QUIC Capture Script
+        env:
+          TARGET_BROWSER: ${{ matrix.browser_id }}
         shell: python
         run: |
           import asyncio
@@ -82,11 +131,11 @@ jobs:
           from scapy.all import rdpcap, UDP
 
           os_name = sys.platform  # 'linux', 'win32', 'darwin'
+          target_browser = os.environ.get("TARGET_BROWSER")
           
           dump_dir = "dumps"
           tiers = {"tier1": [], "tier2": []}
 
-          # Чтение списков доменов из корня репозитория
           for tier_key in tiers.keys():
               filename = f"{tier_key}.txt"
               if os.path.exists(filename):
@@ -131,6 +180,12 @@ jobs:
                   "webkit_mac": {"type": "webkit", "path": None}
               }
 
+          if target_browser not in browsers:
+              print(f"[-] Browser {target_browser} is not defined for {os_name}")
+              sys.exit(1)
+
+          cfg = browsers[target_browser]
+
           def start_sniffer(pcap_path):
               if os_name == "win32":
                   etl_path = pcap_path.replace(".pcap", ".etl")
@@ -153,7 +208,7 @@ jobs:
                   )
 
           def stop_sniffer(proc, pcap_path):
-              time.sleep(1)
+              time.sleep(0.3)
               if os_name == "win32":
                   etl_path = pcap_path.replace(".pcap", ".etl")
                   subprocess.run(["pktmon", "stop"], capture_output=True)
@@ -164,11 +219,19 @@ jobs:
                   if proc:
                       try:
                           proc.terminate()
-                          proc.wait(timeout=3)
-                      except:
-                          proc.kill()
-                  subprocess.run(["sudo", "killall", "-2", "tcpdump"], check=False)
-              time.sleep(1)
+                          proc.wait(timeout=2)
+                      except Exception:
+                          try:
+                              proc.kill()
+                          except Exception:
+                              pass
+                  # Заглушаем вывод killall, если процесс уже был корректно завершен
+                  subprocess.run(
+                      ["sudo", "killall", "-2", "tcpdump"],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL,
+                      check=False
+                  )
 
           def extract_clean_quic_hex(pcap_path):
               if not os.path.exists(pcap_path):
@@ -205,17 +268,17 @@ jobs:
 
                   print(f"[*] Starting {tier_key} ({len(domains)} domains) for {name}")
 
-                  for domain in domains:
+                  for idx, domain in enumerate(domains, 1):
                       if os.path.exists(pcap_file):
                           os.remove(pcap_file)
                       if os.path.exists(etl_file):
                           os.remove(etl_file)
 
                       target_url = f"https://{domain}"
-                      print(f"[*] [{tier_key}] Probing {domain} with {name}...")
+                      print(f"[{idx}/{len(domains)}] [{tier_key}] Probing {domain}...")
 
                       sniff_proc = start_sniffer(pcap_file)
-                      time.sleep(1.5)
+                      time.sleep(0.3)
 
                       try:
                           launch_opts = {"headless": True}
@@ -241,7 +304,7 @@ jobs:
 
                           page = await browser.new_page()
                           try:
-                              await page.goto(target_url, timeout=7000)
+                              await page.goto(target_url, timeout=4000)
                           except:
                               pass
                           await browser.close()
@@ -256,43 +319,42 @@ jobs:
                           out_file = os.path.join(tier_dir, filename)
                           with open(out_file, "w", encoding="ascii") as f:
                               f.write(hex_data)
-                          print(f"[+] SUCCESS: {name} captured on {domain}! ({len(hex_data)//2} bytes) -> {filename}")
+                          print(f"[+] SUCCESS: {domain} ({len(hex_data)//2} bytes) -> {filename}")
                       else:
                           print(f"[-] No QUIC Initial on {domain}")
 
           async def main():
               async with async_playwright() as p:
-                  for name, cfg in browsers.items():
-                      await capture_browser(p, name, cfg)
+                  await capture_browser(p, target_browser, cfg)
 
           asyncio.run(main())
 
       # ==========================================
-      # 5. ВЫГРУЗКА ПРОМЕЖУТОЧНОГО АРТЕФАКТА ДЛЯ ОС
+      # 5. ВЫГРУЗКА ДАМПОВ КОНКРЕТНОГО БРАУЗЕРА
       # ==========================================
       - name: Upload Clean QUIC Dumps
         uses: actions/upload-artifact@v4
         with:
-          name: raw-dumps-${{ matrix.os }}
+          name: raw-dumps-${{ matrix.browser_id }}
           path: dumps/
 
   # ============================================================================
-  # 6. АГРЕГАЦИЯ: СБОР ВСЕХ ОС В ЕДИНЫЙ АРХИВ С СОХРАНЕНИЕМ СТРУКТУРЫ tier1/tier2
+  # 6. АГРЕГАЦИЯ: СБОР ВСЕХ 12 БРАУЗЕРОВ В ЕДИНЫЙ АРХИВ (tier1/ и tier2/)
   # ============================================================================
   aggregate:
-    name: Combine All OS Dumps into Single Archive
+    name: Combine All Dumps into Single Archive
     needs: capture
     runs-on: ubuntu-latest
     steps:
-      - name: Download all OS artifacts
+      - name: Download all browser artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: raw-dumps-*
-          path: merged-dumps
+          path: unified_dumps
           merge-multiple: true
 
       - name: Upload Unified Archive
         uses: actions/upload-artifact@v4
         with:
           name: quic-clean-dumps-all
-          path: merged-dumps/
+          path: unified_dumps/
